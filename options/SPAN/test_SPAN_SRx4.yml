@@ -1,0 +1,96 @@
+# general settings
+name: train_SPAN_SRx4_B6N2
+model_type: SRModel
+scale: 4
+num_gpu: 1
+manual_seed: 0
+
+# dataset and data loader settings
+datasets:
+  val_Set5:
+    name: Set5
+    type: PairedImageDataset
+    dataroot_gt: ~/Benchmark/HR/Set5/x4
+    dataroot_lq: ~/Benchmark/LRBI/Set5/x4
+    filename_tmpl: '{}_LRBI_x4'
+    io_backend:
+      type: disk
+
+  val_Set14:
+    name: Set14
+    type: PairedImageDataset
+    dataroot_gt: ~/Benchmark/HR/Set14/x4
+    dataroot_lq: ~/Benchmark/LRBI/Set14/x4
+    filename_tmpl: '{}_LRBI_x4'
+    io_backend:
+      type: disk
+
+  val_BSD100:
+    name: BSD100
+    type: PairedImageDataset
+    dataroot_gt: ~/Benchmark/HR/B100/x4
+    dataroot_lq: ~/Benchmark/LRBI/B100/x4
+    filename_tmpl: '{}_LRBI_x4'
+    io_backend:
+      type: disk
+  
+  val_Urban100:
+    name: Urban100
+    type: PairedImageDataset
+    dataroot_gt: ~/Benchmark/HR/Urban100/x4
+    dataroot_lq: ~/Benchmark/LRBI/Urban100/x4
+    filename_tmpl: '{}_LRBI_x4'
+    io_backend:
+      type: disk
+
+  val_Manga109:
+    name: Manga109
+    type: PairedImageDataset
+    dataroot_gt: ~/Benchmark/HR/Manga109/x4
+    dataroot_lq: ~/Benchmark/LRBI/Manga109/x4
+    filename_tmpl: '{}_LRBI_x4'
+    io_backend:
+      type: disk
+
+# network structures
+network_g:
+  type: SPAN
+  upscale: 4
+  in_chans: 3
+  img_size: 66
+  window_size: 12
+  overlap_size: 3
+  padding_size: 0
+  img_range: 1.
+  depths: [2, 2, 2, 2, 2, 2]
+  embed_dim: 60
+  num_heads: [6, 6, 6, 6, 6, 6]
+  mlp_ratio: 2
+  upsampler: 'pixelshuffledirect'
+  resi_connection: '1conv'
+
+# pretrain path
+path:
+  pretrain_network_g: pretrained/sr4.pth
+  strict_load_g: true
+  param_key_g: params_ema
+
+# validation settings
+val:
+  save_img: true
+  # 对保存的图片添加后缀，如果是None, 则使用exp name
+  suffix: None
+
+  # 测试时候使用的metric
+  metrics:
+    # metric的名字, 这个名字可以是任意的
+    psnr:
+      # metric的类型, 一般为在\`basicsr/metrics\`目录下定义的metric函数名
+      type: calculate_psnr
+      crop_border: 4
+      test_y_channel: true
+    # 另外一个metric
+    ssim:
+      type: calculate_ssim
+      crop_border: 4
+      test_y_channel: true
