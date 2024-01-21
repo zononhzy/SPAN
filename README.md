@@ -57,8 +57,8 @@ The test set contains five datasets, Set5, Set14, B100, Urban100, Manga109. The 
 ```bash
 # test SPAN for lightweight SR task
 python basicsr/test.py -opt options/SPAN/test_SPAN_SRx2.yml
-python basicsr/test.py -opt options/SPAN/test_SPAN_SRx2.yml
-python basicsr/test.py -opt options/SPAN/test_SPAN_SRx2.yml
+python basicsr/test.py -opt options/SPAN/test_SPAN_SRx3.yml
+python basicsr/test.py -opt options/SPAN/test_SPAN_SRx4.yml
 ```
 
 ## Results
