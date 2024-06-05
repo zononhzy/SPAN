@@ -1,16 +1,14 @@
-# model: SRFormer
-# SRFormer: Permuted Self-Attention for Single Image Super-Resolution
+# model: SPAN
+# Lightweight Image Super-Resolution with Sliding Proxy Attention Network
 
 import math
-from turtle import width
 import torch
 import torch.nn as nn
-import torch.utils.checkpoint as checkpoint
 
 from basicsr.utils.registry import ARCH_REGISTRY
 from basicsr.archs.arch_util import to_2tuple, trunc_normal_
 import torch.nn.functional as F
-import einops
+from itertools import repeat
 from fvcore.nn import FlopCountAnalysis, flop_count_table
 
 
@@ -49,9 +47,9 @@ class LayerNormProxy(nn.Module):
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, x):
-        x = einops.rearrange(x, "b c h w -> b h w c").contiguous()
+        x = x.permute(0, 2, 3, 1).contiguous()
         x = self.norm(x)
-        return einops.rearrange(x, "b h w c -> b c h w").contiguous()
+        return x.permute(0, 3, 1, 2).contiguous()
 
 
 class SpatialGate(nn.Module):
@@ -139,7 +137,7 @@ def window_reverse(windows, window_size, h, w):
     return x
 
 
-def window_overlap_partition(x, window_size, overlap_size, padding_size=0):
+def window_overlap_partition(x, window_size, overlap_size, padding_size=0, num_head=6):
     """
     Args:
         x: (b, c, h, w)
@@ -147,26 +145,25 @@ def window_overlap_partition(x, window_size, overlap_size, padding_size=0):
         overlap_size (int): overlap size
 
     Returns:
-        windows: (num_windows*b, c, window_size, window_size)
+        windows: (b, num_window, num_head*3, window_size*window_size, c_head)
     """
-    b, c, h, w = x.shape
+    _, c, _, _ = x.shape
     x = F.unfold(x, kernel_size=(window_size, window_size), stride=window_size - overlap_size, padding=padding_size)
-    x = einops.rearrange(x, "b (c k1 k2) n-> (b n) c k1 k2", c=c, k1=window_size)
+    x = x.reshape(x.shape[0], num_head*3, c // (num_head * 3), window_size * window_size, -1).permute(0, 4, 1, 3, 2).contiguous()
     return x
 
 
 def window_overlap_reverse(windows, h, w, batch_img, window_size, overlap_size, padding_size=0):
     """
     Args:
-        windows: (num_windows*b, c, window_size, window_size)
+        windows: (b, num_window, num_head, c, window_size*window_size) or (b, num_window, num_head, window_size*window_size)
         window_size (int): Window size
         overlap_size (int): overlap size
-        divisor (int): divisor of window_size
 
     Returns:
         x: (b, c, h, w)
     """
-    windows = einops.rearrange(windows, "(b n) c k1 k2 -> b (c k1 k2) n", b=batch_img)
+    windows = windows.permute(0, 2, 4, 3, 1).contiguous().reshape(batch_img, -1, windows.shape[1])
     windows = F.fold(
         input=windows,
         output_size=(h, w),
@@ -235,11 +232,10 @@ class HFTAttention(nn.Module):
         # high frequency texture attention
         b, c, h, w = x.shape
         # x_after = self.conv_before(x)
-        attn = torch.zeros_like(x)
+        attn = len(self.pool_scale) * x
         for i in range(len(self.pool_scale)):
             x_pool = F.adaptive_avg_pool2d(x, output_size=(h // self.pool_scale[i], w // self.pool_scale[i]))
-            x_upsample = F.interpolate(x_pool, size=(h, w), mode="nearest")
-            attn += x - x_upsample
+            attn -= F.interpolate(x_pool, size=(h, w), mode="nearest")
         attn = self.conv_after_upsample(attn) * x
 
         return attn
@@ -279,7 +275,7 @@ class ELFEB(nn.Module):
         return x
 
 class SPAB(nn.Module):
-    r"""Sliding Proxy Attention Block 
+    r"""Sliding Proxy Attention Block
 
     Args:
         dim (int): Number of input channels.
@@ -373,34 +369,22 @@ class SPAB(nn.Module):
         x = self.qkv(x)
         # partition windows
         x_windows = window_overlap_partition(
-            x, self.window_size, self.overlap_size, self.padding_size
-        )  # nW*b_, c, window_size, window_size
-        b = x_windows.shape[0]
+            x, self.window_size, self.overlap_size, self.padding_size, self.num_heads
+        )  # b, n, nH*3, hc, Wh*Ww
 
-        qkv = (
-            x_windows.reshape(b, 3, self.num_heads, c // self.num_heads, self.window_size, self.window_size)
-            .reshape(b, 3, self.num_heads, -1, self.window_size**2)
-            .permute(0, 1, 2, 4, 3)
-        )
-        q, k, v = (
-            qkv[:, 0, ...].contiguous(),
-            qkv[:, 1, ...].contiguous(),
-            qkv[:, 2, ...].contiguous(),
-        )  # b, nH, Wh*Ww, d_H
-        q = q * self.temperature  # b, nH, Wh*Ww, d_H
-        attn = q @ k.transpose(-2, -1)  ## b, nH, Wh*Ww, Wh*Ww
+        q, k, v = torch.chunk(x_windows, 3, dim=2)  # b, n, nH, Wh*Ww, hc
+        q = q * self.temperature[None, None]  # b, n, nH, Wh*Ww, hc
+        attn = q @ k.transpose(-2, -1)  # b, n, nH, Wh*Ww, Wh*Ww
 
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             self.window_size**2, self.window_size**2, -1
         )  # Wh*Ww,Wh*Ww,nH
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-        attn = attn + relative_position_bias.unsqueeze(0)  # b, nH, Wh*Ww, Wh*Ww
+        attn = attn + relative_position_bias[None, None]  # b, n, nH, Wh*Ww, Wh*Ww
 
-        max_attn = torch.max(attn, dim=-1, keepdim=True)[0]  # b, nH, Wh*Ww, 1 #for numerical stability
-        exp_attn = torch.exp(attn - max_attn)  # b, nH, Wh*Ww, Wh*Ww
-        sum_attn = torch.sum(exp_attn, dim=-1).reshape(
-            b, self.num_heads, self.window_size, self.window_size
-        )  # b, nH, Wh, Ww
+        max_attn = torch.max(attn, dim=-1, keepdim=True)[0]  # b, n, nH, Wh*Ww, 1 #for numerical stability
+        exp_attn = torch.exp(attn - max_attn)  # b, n, nH, Wh*Ww, Wh*Ww
+        sum_attn = torch.sum(exp_attn, dim=-1, keepdim=True)  # b, n, nH, Wh*Ww, 1
         sum_attn = window_overlap_reverse(
             sum_attn,
             h,
@@ -411,7 +395,7 @@ class SPAB(nn.Module):
             padding_size=self.padding_size,
         )  # b_, nH, h, w
 
-        exp_attn = (exp_attn @ v).transpose(-2, -1).reshape(b, c, self.window_size, self.window_size)  # b, c, Wh, Ww
+        exp_attn = exp_attn @ v  # b n nH Wh*Ww c
 
         exp_attn = window_overlap_reverse(
             exp_attn,
@@ -421,9 +405,7 @@ class SPAB(nn.Module):
             window_size=self.window_size,
             overlap_size=self.overlap_size,
             padding_size=self.padding_size,
-        ).reshape(
-            b_, self.num_heads, self.head_dim, h, w
-        )  # b_, nH, d_H, h, w
+        ).reshape(b_, self.num_heads, self.head_dim, h, w)
 
         attn = exp_attn / sum_attn.unsqueeze(2)  # b_, nH, d_H, h, w
         attn = attn.reshape(b_, c, h, w)  # b_, c, h, w
@@ -433,54 +415,10 @@ class SPAB(nn.Module):
         # FFN
         x = shortcut + self.drop_path(x)
         x = x + self.drop_path(self.conv_ffn(self.norm2(x)))
-
         return x
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, window_size={self.window_size}, overlap_size={self.overlap_size}, padding_size={self.padding_size}, mlp_ratio={self.mlp_ratio}"
-
-
-class PatchMerging(nn.Module):
-    r"""Patch Merging Layer.
-
-    Args:
-        input_resolution (tuple[int]): Resolution of input feature.
-        dim (int): Number of input channels.
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-    """
-
-    def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.input_resolution = input_resolution
-        self.dim = dim
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
-        self.norm = norm_layer(4 * dim)
-
-    def forward(self, x):
-        """
-        x: b, h*w, c
-        """
-        h, w = self.input_resolution
-        b, seq_len, c = x.shape
-        assert seq_len == h * w, "input feature has wrong size"
-        assert h % 2 == 0 and w % 2 == 0, f"x size ({h}*{w}) are not even."
-
-        x = x.view(b, h, w, c)
-
-        x0 = x[:, 0::2, 0::2, :]  # b h/2 w/2 c
-        x1 = x[:, 1::2, 0::2, :]  # b h/2 w/2 c
-        x2 = x[:, 0::2, 1::2, :]  # b h/2 w/2 c
-        x3 = x[:, 1::2, 1::2, :]  # b h/2 w/2 c
-        x = torch.cat([x0, x1, x2, x3], -1)  # b h/2 w/2 4*c
-        x = x.view(b, -1, 4 * c)  # b h/2*w/2 4*c
-
-        x = self.norm(x)
-        x = self.reduction(x)
-
-        return x
-
-    def extra_repr(self) -> str:
-        return f"input_resolution={self.input_resolution}, dim={self.dim}"
 
 
 class BasicLayer(nn.Module):
@@ -549,7 +487,7 @@ class BasicLayer(nn.Module):
                 for i in range(depth)
             ]
         )
-        
+
         # patch merging layer
         if downsample is not None:
             self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
@@ -558,10 +496,7 @@ class BasicLayer(nn.Module):
 
     def forward(self, x):
         for blk in self.blocks:
-            if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x) + x
-            else:
-                x = blk(x) + x
+            x = blk(x) + x
         if self.downsample is not None:
             x = self.downsample(x)
         return x
@@ -571,7 +506,7 @@ class BasicLayer(nn.Module):
 
 
 class SPTB(nn.Module):
-    """Sliding Proxy Transformer Block 
+    """Sliding Proxy Transformer Block
 
     Args:
         dim (int): Number of input channels.
@@ -639,72 +574,6 @@ class SPTB(nn.Module):
 
     def forward(self, x):
         return self.esa(self.residual_group(x))
-
-
-class PatchEmbed(nn.Module):
-    r"""Image to Patch Embedding
-
-    Args:
-        img_size (int): Image size.  Default: 224.
-        patch_size (int): Patch token size. Default: 4.
-        in_chans (int): Number of input image channels. Default: 3.
-        embed_dim (int): Number of linear projection output channels. Default: 96.
-        norm_layer (nn.Module, optional): Normalization layer. Default: None
-    """
-
-    def __init__(self, img_size=224, window_size=22, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
-        super().__init__()
-        # if img_size % window_size != 0:
-        #     img_size = img_size + (window_size - img_size % window_size)
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
-        patches_resolution = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.patches_resolution = patches_resolution
-        self.num_patches = patches_resolution[0] * patches_resolution[1]
-
-        self.in_chans = in_chans
-        self.embed_dim = embed_dim
-
-        if norm_layer is not None:
-            self.norm = norm_layer(embed_dim)
-        else:
-            self.norm = None
-
-    def forward(self, x):
-        if self.norm is not None:
-            x = self.norm(x)
-        return x
-
-
-class PatchUnEmbed(nn.Module):
-    r"""Image to Patch Unembedding
-
-    Args:
-        img_size (int): Image size.  Default: 224.
-        patch_size (int): Patch token size. Default: 4.
-        in_chans (int): Number of input image channels. Default: 3.
-        embed_dim (int): Number of linear projection output channels. Default: 96.
-        norm_layer (nn.Module, optional): Normalization layer. Default: None
-    """
-
-    def __init__(self, img_size=224, window_size=24, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
-        super().__init__()
-        # if img_size % window_size != 0:
-        #     img_size = img_size + (window_size - img_size % window_size)
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
-        patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.patches_resolution = patches_resolution
-        self.num_patches = patches_resolution[0] * patches_resolution[1]
-        self.in_chans = in_chans
-        self.embed_dim = embed_dim
-
-    def forward(self, x):
-        return x
 
 
 class Upsample(nn.Sequential):
@@ -967,11 +836,12 @@ class SPAN(nn.Module):
 
 if __name__ == "__main__":
     with torch.no_grad():
+        upscale = 2
         overlap_size = 3
         window_size = 12
         padding_size = 0
-        height = 1280 // 2
-        width = 720 // 2
+        height = 1280 // upscale
+        width = 720 // upscale
         mod_pad_h = (
             window_size - overlap_size - (height + padding_size * 2 - overlap_size) % (window_size - overlap_size)
         ) % (window_size - overlap_size)
@@ -982,7 +852,7 @@ if __name__ == "__main__":
         height = height + mod_pad_h
         width = width + mod_pad_w
         model = SPAN(
-            upscale=2,
+            upscale=upscale,
             in_chans=3,
             img_size=(height, width),
             window_size=window_size,
@@ -995,8 +865,39 @@ if __name__ == "__main__":
             mlp_ratio=2,
             upsampler="pixelshuffledirect",
             resi_connection="1conv",
-        )
-        print("height, width, ", height, width)
-        input = torch.randn(1, 3, height, width)
+        ).to("cuda:1")
+        model.eval()
+        input = torch.randn(1, 3, height, width).to("cuda:1")
         flops = FlopCountAnalysis(model, (input,))
         print(flop_count_table(flops, show_param_shapes=False))
+
+        torch.set_float32_matmul_precision('high')
+        script_model = torch.compile(model)
+
+        import numpy as np
+        import tqdm
+
+        repititions = 10
+
+        print("warming up ...\n")
+        with torch.no_grad():
+            for i in range(repititions):
+                script_model(input)
+
+        torch.cuda.synchronize()
+
+        starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        timings = np.zeros((repititions, 1))
+
+        print("Measuring ...")
+
+        with torch.no_grad():
+            for rep in tqdm.tqdm(range(repititions)):
+                starter.record()
+                _ = script_model(input)
+                ender.record()
+                torch.cuda.synchronize()
+                timings[rep] = starter.elapsed_time(ender)
+
+        avg = np.sum(timings) / repititions
+        print(f"Average time: {avg} ms")
